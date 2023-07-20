@@ -6,6 +6,8 @@ import http from 'http'
 import * as fs from 'fs'
 import basicAuth from 'express-basic-auth'
 import { Server } from 'socket.io'
+import logger from './utils/logger'
+import { expressRequestLogger } from './utils/logger'
 
 import {
     IChatFlow,
@@ -35,7 +37,10 @@ import {
     isSameOverrideConfig,
     replaceAllAPIKeys,
     isFlowValidForStream,
-    isVectorStoreFaiss
+    isVectorStoreFaiss,
+    databaseEntities,
+    getApiKey,
+    clearSessionMemory
 } from './utils'
 import { cloneDeep } from 'lodash'
 import { getDataSource } from './DataSource'
@@ -43,8 +48,9 @@ import { NodesPool } from './NodesPool'
 import { ChatFlow } from './entity/ChatFlow'
 import { ChatMessage } from './entity/ChatMessage'
 import { ChatflowPool } from './ChatflowPool'
-import { ICommonObject } from 'flowise-components'
+import { ICommonObject, INodeOptionsValue } from 'flowise-components'
 import { fork } from 'child_process'
+import { Tool } from './entity/Tool'
 
 export class App {
     app: express.Application
@@ -60,7 +66,7 @@ export class App {
         // Initialize database
         this.AppDataSource.initialize()
             .then(async () => {
-                console.info('📦[server]: Data Source has been initialized!')
+                logger.info('📦 [server]: Data Source has been initialized!')
 
                 // Initialize pools
                 this.nodesPool = new NodesPool()
@@ -72,7 +78,7 @@ export class App {
                 await getAPIKeys()
             })
             .catch((err) => {
-                console.error('❌[server]: Error during Data Source initialization:', err)
+                logger.error('❌ [server]: Error during Data Source initialization:', err)
             })
     }
 
@@ -84,13 +90,23 @@ export class App {
         // Allow access from *
         this.app.use(cors())
 
+        // Add the expressRequestLogger middleware to log all requests
+        this.app.use(expressRequestLogger)
+
         if (process.env.FLOWISE_USERNAME && process.env.FLOWISE_PASSWORD) {
             const username = process.env.FLOWISE_USERNAME
             const password = process.env.FLOWISE_PASSWORD
             const basicAuthMiddleware = basicAuth({
                 users: { [username]: password }
             })
-            const whitelistURLs = ['/api/v1/prediction/', '/api/v1/node-icon/', '/api/v1/chatflows-streaming']
+            const whitelistURLs = [
+                '/api/v1/verify/apikey/',
+                '/api/v1/chatflows/apikey/',
+                '/api/v1/public-chatflows',
+                '/api/v1/prediction/',
+                '/api/v1/node-icon/',
+                '/api/v1/chatflows-streaming'
+            ]
             this.app.use((req, res, next) => {
                 if (req.url.includes('/api/v1/')) {
                     whitelistURLs.some((url) => req.url.includes(url)) ? next() : basicAuthMiddleware(req, res, next)
@@ -142,6 +158,29 @@ export class App {
             }
         })
 
+        // load async options
+        this.app.post('/api/v1/node-load-method/:name', async (req: Request, res: Response) => {
+            const nodeData: INodeData = req.body
+            if (Object.prototype.hasOwnProperty.call(this.nodesPool.componentNodes, req.params.name)) {
+                try {
+                    const nodeInstance = this.nodesPool.componentNodes[req.params.name]
+                    const methodName = nodeData.loadMethod || ''
+
+                    const returnOptions: INodeOptionsValue[] = await nodeInstance.loadMethods![methodName]!.call(nodeInstance, nodeData, {
+                        appDataSource: this.AppDataSource,
+                        databaseEntities: databaseEntities
+                    })
+
+                    return res.json(returnOptions)
+                } catch (error) {
+                    return res.json([])
+                }
+            } else {
+                res.status(404).send(`Node ${req.params.name} not found`)
+                return
+            }
+        })
+
         // ----------------------------------------
         // Chatflows
         // ----------------------------------------
@@ -152,12 +191,41 @@ export class App {
             return res.json(chatflows)
         })
 
+        // Get specific chatflow via api key
+        this.app.get('/api/v1/chatflows/apikey/:apiKey', async (req: Request, res: Response) => {
+            try {
+                const apiKey = await getApiKey(req.params.apiKey)
+                if (!apiKey) return res.status(401).send('Unauthorized')
+                const chatflows = await this.AppDataSource.getRepository(ChatFlow)
+                    .createQueryBuilder('cf')
+                    .where('cf.apikeyid = :apikeyid', { apikeyid: apiKey.id })
+                    .orWhere('cf.apikeyid IS NULL')
+                    .orWhere('cf.apikeyid = ""')
+                    .orderBy('cf.name', 'ASC')
+                    .getMany()
+                if (chatflows.length >= 1) return res.status(200).send(chatflows)
+                return res.status(404).send('Chatflow not found')
+            } catch (err: any) {
+                return res.status(500).send(err?.message)
+            }
+        })
+
         // Get specific chatflow via id
         this.app.get('/api/v1/chatflows/:id', async (req: Request, res: Response) => {
             const chatflow = await this.AppDataSource.getRepository(ChatFlow).findOneBy({
                 id: req.params.id
             })
             if (chatflow) return res.json(chatflow)
+            return res.status(404).send(`Chatflow ${req.params.id} not found`)
+        })
+
+        // Get specific chatflow via id (PUBLIC endpoint, used when sharing chatbot link)
+        this.app.get('/api/v1/public-chatflows/:id', async (req: Request, res: Response) => {
+            const chatflow = await this.AppDataSource.getRepository(ChatFlow).findOneBy({
+                id: req.params.id
+            })
+            if (chatflow && chatflow.isPublic) return res.json(chatflow)
+            else if (chatflow && !chatflow.isPublic) return res.status(401).send(`Unauthorized`)
             return res.status(404).send(`Chatflow ${req.params.id} not found`)
         })
 
@@ -216,10 +284,16 @@ export class App {
             const nodes = parsedFlowData.nodes
             const edges = parsedFlowData.edges
             const { graph, nodeDependencies } = constructGraphs(nodes, edges)
+
             const endingNodeId = getEndingNode(nodeDependencies, graph)
-            if (!endingNodeId) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+            if (!endingNodeId) return res.status(500).send(`Ending node ${endingNodeId} not found`)
+
             const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
-            if (!endingNodeData) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+            if (!endingNodeData) return res.status(500).send(`Ending node ${endingNodeId} data not found`)
+
+            if (endingNodeData && endingNodeData.category !== 'Chains' && endingNodeData.category !== 'Agents') {
+                return res.status(500).send(`Ending node must be either a Chain or Agent`)
+            }
 
             const obj = {
                 isStreaming: isFlowValidForStream(nodes, endingNodeData)
@@ -233,8 +307,13 @@ export class App {
 
         // Get all chatmessages from chatflowid
         this.app.get('/api/v1/chatmessage/:id', async (req: Request, res: Response) => {
-            const chatmessages = await this.AppDataSource.getRepository(ChatMessage).findBy({
-                chatflowid: req.params.id
+            const chatmessages = await this.AppDataSource.getRepository(ChatMessage).find({
+                where: {
+                    chatflowid: req.params.id
+                },
+                order: {
+                    createdDate: 'ASC'
+                }
             })
             return res.json(chatmessages)
         })
@@ -253,7 +332,77 @@ export class App {
 
         // Delete all chatmessages from chatflowid
         this.app.delete('/api/v1/chatmessage/:id', async (req: Request, res: Response) => {
+            const chatflow = await this.AppDataSource.getRepository(ChatFlow).findOneBy({
+                id: req.params.id
+            })
+            if (!chatflow) {
+                res.status(404).send(`Chatflow ${req.params.id} not found`)
+                return
+            }
+            const flowData = chatflow.flowData
+            const parsedFlowData: IReactFlowObject = JSON.parse(flowData)
+            const nodes = parsedFlowData.nodes
+            let chatId = await getChatId(chatflow.id)
+            if (!chatId) chatId = chatflow.id
+            clearSessionMemory(nodes, this.nodesPool.componentNodes, chatId, req.query.sessionId as string)
             const results = await this.AppDataSource.getRepository(ChatMessage).delete({ chatflowid: req.params.id })
+            return res.json(results)
+        })
+
+        // ----------------------------------------
+        // Tools
+        // ----------------------------------------
+
+        // Get all tools
+        this.app.get('/api/v1/tools', async (req: Request, res: Response) => {
+            const tools = await this.AppDataSource.getRepository(Tool).find()
+            return res.json(tools)
+        })
+
+        // Get specific tool
+        this.app.get('/api/v1/tools/:id', async (req: Request, res: Response) => {
+            const tool = await this.AppDataSource.getRepository(Tool).findOneBy({
+                id: req.params.id
+            })
+            return res.json(tool)
+        })
+
+        // Add tool
+        this.app.post('/api/v1/tools', async (req: Request, res: Response) => {
+            const body = req.body
+            const newTool = new Tool()
+            Object.assign(newTool, body)
+
+            const tool = this.AppDataSource.getRepository(Tool).create(newTool)
+            const results = await this.AppDataSource.getRepository(Tool).save(tool)
+
+            return res.json(results)
+        })
+
+        // Update tool
+        this.app.put('/api/v1/tools/:id', async (req: Request, res: Response) => {
+            const tool = await this.AppDataSource.getRepository(Tool).findOneBy({
+                id: req.params.id
+            })
+
+            if (!tool) {
+                res.status(404).send(`Tool ${req.params.id} not found`)
+                return
+            }
+
+            const body = req.body
+            const updateTool = new Tool()
+            Object.assign(updateTool, body)
+
+            this.AppDataSource.getRepository(Tool).merge(tool, updateTool)
+            const result = await this.AppDataSource.getRepository(Tool).save(tool)
+
+            return res.json(result)
+        })
+
+        // Delete tool
+        this.app.delete('/api/v1/tools/:id', async (req: Request, res: Response) => {
+            const results = await this.AppDataSource.getRepository(Tool).delete({ id: req.params.id })
             return res.json(results)
         })
 
@@ -343,12 +492,12 @@ export class App {
         // ----------------------------------------
 
         // Get all chatflows for marketplaces
-        this.app.get('/api/v1/marketplaces', async (req: Request, res: Response) => {
-            const marketplaceDir = path.join(__dirname, '..', 'marketplaces')
+        this.app.get('/api/v1/marketplaces/chatflows', async (req: Request, res: Response) => {
+            const marketplaceDir = path.join(__dirname, '..', 'marketplaces', 'chatflows')
             const jsonsInDir = fs.readdirSync(marketplaceDir).filter((file) => path.extname(file) === '.json')
             const templates: any[] = []
             jsonsInDir.forEach((file, index) => {
-                const filePath = path.join(__dirname, '..', 'marketplaces', file)
+                const filePath = path.join(__dirname, '..', 'marketplaces', 'chatflows', file)
                 const fileData = fs.readFileSync(filePath)
                 const fileDataObj = JSON.parse(fileData.toString())
                 const template = {
@@ -356,6 +505,25 @@ export class App {
                     name: file.split('.json')[0],
                     flowData: fileData.toString(),
                     description: fileDataObj?.description || ''
+                }
+                templates.push(template)
+            })
+            return res.json(templates)
+        })
+
+        // Get all tools for marketplaces
+        this.app.get('/api/v1/marketplaces/tools', async (req: Request, res: Response) => {
+            const marketplaceDir = path.join(__dirname, '..', 'marketplaces', 'tools')
+            const jsonsInDir = fs.readdirSync(marketplaceDir).filter((file) => path.extname(file) === '.json')
+            const templates: any[] = []
+            jsonsInDir.forEach((file, index) => {
+                const filePath = path.join(__dirname, '..', 'marketplaces', 'tools', file)
+                const fileData = fs.readFileSync(filePath)
+                const fileDataObj = JSON.parse(fileData.toString())
+                const template = {
+                    ...fileDataObj,
+                    id: index,
+                    templateName: file.split('.json')[0]
                 }
                 templates.push(template)
             })
@@ -388,6 +556,17 @@ export class App {
         this.app.delete('/api/v1/apikey/:id', async (req: Request, res: Response) => {
             const keys = await deleteAPIKey(req.params.id)
             return res.json(keys)
+        })
+
+        // Verify api key
+        this.app.get('/api/v1/verify/apikey/:apiKey', async (req: Request, res: Response) => {
+            try {
+                const apiKey = await getApiKey(req.params.apiKey)
+                if (!apiKey) return res.status(401).send('Unauthorized')
+                return res.status(200).send('OK')
+            } catch (err: any) {
+                return res.status(500).send(err?.message)
+            }
         })
 
         // ----------------------------------------
@@ -484,7 +663,7 @@ export class App {
                 })
             })
         } catch (err) {
-            console.error(err)
+            logger.error('[server] [mode:child]: Error:', err)
         }
     }
 
@@ -508,7 +687,7 @@ export class App {
             if (!chatflow) return res.status(404).send(`Chatflow ${chatflowid} not found`)
 
             let chatId = await getChatId(chatflow.id)
-            if (!chatId) chatId = Date.now().toString()
+            if (!chatId) chatId = chatflowid
 
             if (!isInternal) {
                 await this.validateKey(req, res, chatflow)
@@ -538,13 +717,13 @@ export class App {
                 }
             }
 
-            /* Don't rebuild the flow (to avoid duplicated upsert, recomputation) when all these conditions met:
+            /*   Reuse the flow without having to rebuild (to avoid duplicated upsert, recomputation) when all these conditions met:
              * - Node Data already exists in pool
              * - Still in sync (i.e the flow has not been modified since)
              * - Existing overrideConfig and new overrideConfig are the same
              * - Flow doesn't start with nodes that depend on incomingInput.question
              ***/
-            const isRebuildNeeded = () => {
+            const isFlowReusable = () => {
                 return (
                     Object.prototype.hasOwnProperty.call(this.chatflowPool.activeChatflows, chatflowid) &&
                     this.chatflowPool.activeChatflows[chatflowid].inSync &&
@@ -558,11 +737,13 @@ export class App {
             }
 
             if (process.env.EXECUTION_MODE === 'child') {
-                if (isRebuildNeeded()) {
+                if (isFlowReusable()) {
                     nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
+                    logger.debug(
+                        `[server] [mode:child]: Reuse existing chatflow ${chatflowid} with ending node ${nodeToExecuteData.label} (${nodeToExecuteData.id})`
+                    )
                     try {
                         const result = await this.startChildProcess(chatflow, chatId, incomingInput, nodeToExecuteData)
-
                         return res.json(result)
                     } catch (error) {
                         return res.status(500).send(error)
@@ -582,18 +763,25 @@ export class App {
                 const nodes = parsedFlowData.nodes
                 const edges = parsedFlowData.edges
 
-                if (isRebuildNeeded()) {
+                if (isFlowReusable()) {
                     nodeToExecuteData = this.chatflowPool.activeChatflows[chatflowid].endingNodeData
                     isStreamValid = isFlowValidForStream(nodes, nodeToExecuteData)
+                    logger.debug(
+                        `[server]: Reuse existing chatflow ${chatflowid} with ending node ${nodeToExecuteData.label} (${nodeToExecuteData.id})`
+                    )
                 } else {
                     /*** Get Ending Node with Directed Graph  ***/
                     const { graph, nodeDependencies } = constructGraphs(nodes, edges)
                     const directedGraph = graph
                     const endingNodeId = getEndingNode(nodeDependencies, directedGraph)
-                    if (!endingNodeId) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+                    if (!endingNodeId) return res.status(500).send(`Ending node ${endingNodeId} not found`)
 
                     const endingNodeData = nodes.find((nd) => nd.id === endingNodeId)?.data
-                    if (!endingNodeData) return res.status(500).send(`Ending node must be either a Chain or Agent`)
+                    if (!endingNodeData) return res.status(500).send(`Ending node ${endingNodeId} data not found`)
+
+                    if (endingNodeData && endingNodeData.category !== 'Chains' && endingNodeData.category !== 'Agents') {
+                        return res.status(500).send(`Ending node must be either a Chain or Agent`)
+                    }
 
                     if (
                         endingNodeData.outputs &&
@@ -614,6 +802,7 @@ export class App {
                     const nonDirectedGraph = constructedObj.graph
                     const { startingNodeIds, depthQueue } = getStartingNodes(nonDirectedGraph, endingNodeId)
 
+                    logger.debug(`[server]: Start building chatflow ${chatflowid}`)
                     /*** BFS to traverse from Starting Nodes to Ending Node ***/
                     const reactFlowNodes = await buildLangchain(
                         startingNodeIds,
@@ -623,6 +812,7 @@ export class App {
                         this.nodesPool.componentNodes,
                         incomingInput.question,
                         chatId,
+                        this.AppDataSource,
                         incomingInput?.overrideConfig
                     )
 
@@ -641,17 +831,21 @@ export class App {
                 const nodeInstance = new nodeModule.nodeClass()
 
                 isStreamValid = isStreamValid && !isVectorStoreFaiss(nodeToExecuteData)
+                logger.debug(`[server]: Running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
                 const result = isStreamValid
                     ? await nodeInstance.run(nodeToExecuteData, incomingInput.question, {
                           chatHistory: incomingInput.history,
                           socketIO,
-                          socketIOClientId: incomingInput.socketIOClientId
+                          socketIOClientId: incomingInput.socketIOClientId,
+                          logger
                       })
-                    : await nodeInstance.run(nodeToExecuteData, incomingInput.question, { chatHistory: incomingInput.history })
+                    : await nodeInstance.run(nodeToExecuteData, incomingInput.question, { chatHistory: incomingInput.history, logger })
 
+                logger.debug(`[server]: Finished running ${nodeToExecuteData.label} (${nodeToExecuteData.id})`)
                 return res.json(result)
             }
         } catch (e: any) {
+            logger.error('[server]: Error:', e)
             return res.status(500).send(e.message)
         }
     }
@@ -661,7 +855,7 @@ export class App {
             const removePromises: any[] = []
             await Promise.all(removePromises)
         } catch (e) {
-            console.error(`❌[server]: Flowise Server shut down error: ${e}`)
+            logger.error(`❌[server]: Flowise Server shut down error: ${e}`)
         }
     }
 }
@@ -701,7 +895,7 @@ export async function start(): Promise<void> {
     await serverApp.config(io)
 
     server.listen(port, () => {
-        console.info(`⚡️[server]: Flowise Server is listening at ${port}`)
+        logger.info(`⚡️ [server]: Flowise Server is listening at ${port}`)
     })
 }
 
